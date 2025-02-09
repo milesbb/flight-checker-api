@@ -22,6 +22,7 @@ REQUEST_HEADERS = {
     "x-rapidapi-host": FLIGHTS_API_URL
 }
 
+
 DEFAULT_REQ_PARAMS = {
     "currency": "GBP",
     "locale": "en-GB",
@@ -146,7 +147,7 @@ def specific_roundtrip(from_location: Location, to_location: Location) -> list[P
         f"Running specific roundtrip search for {from_location.city} to {to_location.city}")
     search_roundtrip_route = {
         **DEFAULT_REQ_PARAMS,
-        "fromEntityId": location.iata_code,
+        "fromEntityId": from_location.iata_code,
         "type": 'roundtrip',
         "year": str(current_datetime.year),
         "month": str(current_datetime.month + 2)
@@ -165,7 +166,7 @@ def specific_roundtrip(from_location: Location, to_location: Location) -> list[P
             destination=roundtrip['legs'][0]['destination']['name'],
             price=roundtrip['price']['formatted'],
             stops=roundtrip['stopCount']
-        ) for roundtrip in roundtrips if roundtrip['price']['raw'] < ROUNDTRIP_PRICE_LIMIT
+        ) for roundtrip in itineraries if roundtrip['price']['raw'] < ROUNDTRIP_PRICE_LIMIT
     ]
 
     logger.info('Finished roundtrip search')
@@ -186,7 +187,7 @@ def get_flights_data(settings: FlightCheckSettings) -> FlightCheckData:
         for target_location in settings.specific_locations:
             data["specific_roundtrips"][from_location.city][target_location.city] = specific_roundtrip(
                 from_location=from_location,
-                to_location=to_location
+                to_location=target_location
             )
     return FlightCheckData(
         search_everywhere=data['search_everywhere'],
