@@ -5,9 +5,9 @@ import logging
 import boto3
 import os
 import json
-import requests
+import http.client
 from datetime import datetime
-from typing import NamedTuple, Union
+from typing import NamedTuple
 
 
 logger = logging.getLogger(__name__)
@@ -17,9 +17,16 @@ FLIGHTS_API_URL = os.getenv("FLIGHTS_SCRAPER_HOST_URL")
 FLIGHTS_API_KEY = os.getenv("FLIGHTS_SCRAPER_API_KEY")
 
 
+conn = http.client.HTTPSConnection(FLIGHTS_API_URL)
+
+
 REQUEST_HEADERS = {
     "x-rapidapi-key": FLIGHTS_API_KEY,
-    "x-rapidapi-host": FLIGHTS_API_URL
+    "x-rapidapi-host": FLIGHTS_API_URL,
+    "Cache-Control": "no-cache",
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    'Connection': 'keep-alive',
 }
 
 
@@ -85,28 +92,30 @@ class FlightCheckData(NamedTuple):
 
 
 def make_request(params: dict, req_path: str):
-    full_request_path = f"{FLIGHTS_API_URL}/flights/{req_path}"
+    url = f"/flights/{req_path}"
+
+    url += f"?{'&'.join([f'{key}={value}' for key, value in params.items()])}"
 
     logger.info(
-        f"Making request with url {full_request_path} and parameters {params}")
+        f"Making request with url {url} (parameters {params})")
+    
+    conn.request("GET", url, headers=REQUEST_HEADERS)
 
-    response = requests.get(
-        url=full_request_path, headers=REQUEST_HEADERS, params=params)
+    response = conn.getresponse()
 
-    print(response)
     print(response.reason)
-    print(response.status_code)
+    print(response.status)
 
-    data = response.json()
-
-    if response.status_code != 200:
-        raise Exception(f'Error with the request: {data["message"]}')
+    if response.status != 200:
+        raise Exception(f"{response.status} Error with the request: {response.reason} - {response.read()}")
     else:
-        return data
+        data = response.read()
+        decoded_data = data.decode("utf-8")
+        return json.loads(decoded_data)
 
 
 def get_prices(journey: dict) -> dict:
-    return journey['content']['flightQuotes']
+    return journey.get('content', {}).get('flightQuotes', {})
 
 
 def search_everywhere(main_home_airport: Location) -> list[PotentialDestination]:
@@ -126,16 +135,18 @@ def search_everywhere(main_home_airport: Location) -> list[PotentialDestination]
 
     logger.info("Finished search everywhere request")
 
-    possible_journeys = search_everywhere_data['data']['everywhereDestination']['results']
+    logger.info(search_everywhere_data)
+
+    possible_journeys = search_everywhere_data.get('data', {}).get('everywhereDestination', {}).get('results', {})
 
     if len(possible_journeys) > 0:
         # under 50 squid
         cheapish_journeys = [PotentialDestination(
-            destination=journey['content']['location']['name'],
-            cheapest_price=get_prices(journey)['cheapest']['price'],
-            is_cheapeast_direct=get_prices(journey)['cheapest']['direct'],
-            cheapest_direct=get_prices(journey)['direct']['price'],
-        ) for journey in possible_journeys if int(get_prices(journey)['cheapest']['price'].replace("£", "")) < EVERYWHERE_PRICE_LIMIT]
+            destination=journey.get('content', {}).get('location', {}).get('name', '?'),
+            cheapest_price=get_prices(journey).get('cheapest', {}).get('price', '?'),
+            is_cheapeast_direct=get_prices(journey).get('cheapest', {}).get('direct', False),
+            cheapest_direct=get_prices(journey).get('direct', {}).get('price', '?'),
+        ) for journey in possible_journeys if get_prices(journey).get('cheapest', {}).get('rawPrice', 0) < EVERYWHERE_PRICE_LIMIT]
 
         return cheapish_journeys
     else:
@@ -158,15 +169,15 @@ def specific_roundtrip(from_location: Location, to_location: Location) -> list[P
         req_path=SEARCH_ROUNDTRIP
     )
 
-    itineraries = roundtrip_data['data']['itineraries']
+    itineraries = roundtrip_data.get('data', {}).get('itineraries', {})
     # under 130 squid
     roundtrips = [
         RoundTrip(
-            origin=roundtrip['legs'][0]['origin']['name'],
-            destination=roundtrip['legs'][0]['destination']['name'],
-            price=roundtrip['price']['formatted'],
-            stops=roundtrip['stopCount']
-        ) for roundtrip in itineraries if roundtrip['price']['raw'] < ROUNDTRIP_PRICE_LIMIT
+            origin=roundtrip.get('legs', []).get(0, {}).get('origin', {}).get('name', "?"),
+            destination=roundtrip.get('legs', []).get(0, {}).get('destination', {}).get('name', "?"),
+            price=roundtrip.get('price', {}).get('formatted', "?"),
+            stops=roundtrip.get('stopCount', 0)
+        ) for roundtrip in itineraries if roundtrip.get('price', {}).get('raw', 0) < ROUNDTRIP_PRICE_LIMIT
     ]
 
     logger.info('Finished roundtrip search')
@@ -185,7 +196,7 @@ def get_flights_data(settings: FlightCheckSettings) -> FlightCheckData:
 
     for from_location in settings.home_airports:
         for target_location in settings.specific_locations:
-            data["specific_roundtrips"][from_location.city][target_location.city] = specific_roundtrip(
+            data["specific_roundtrips"].setdefault(from_location.city, {})[target_location.city] = specific_roundtrip(
                 from_location=from_location,
                 to_location=target_location
             )
@@ -210,6 +221,8 @@ def generate_flight_check_summary(data: FlightCheckData) -> str:
     )
     for origin, destination_roundtrips in data.specific_roundtrips.items():
         for destination, roundtrips in destination_roundtrips.items():
+            if len(roundtrips) == 0:
+                continue
             summary += f"\n\nRound trips for {origin} -> {destination} in 2 months\n"
             summary += generate_bullet_list(
                 [
@@ -229,7 +242,7 @@ def run_and_send_flight_check(settings: FlightCheckSettings):
 
     data = get_flights_data(settings)
 
-    summary = generate_flight_check_summary(settings)
+    summary = generate_flight_check_summary(data)
 
     send_flight_check_data(
         recipient_emails=settings.target_emails,
